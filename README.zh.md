@@ -104,27 +104,32 @@ pnpm dsh --profile web --dump-config
 
 针对 `codex-cli 0.155.0-alpha.16.4` 的实测（同一台机器、同一天）：
 
-| 阶段 | 修复前（WebSocket 传输开启） | 修复后（`httpTransport: true`，默认） |
+| 阶段 | 那一次慢的测量（21:37） | 故障消失后（22:29，同一 home、同样允许 WebSocket） |
 |---|---|---|
-| 进程启动 → 首个协议帧 | 342 ms | 309 ms |
-| **首轮：`turn/start` → 第一个 token** | **115821 ms** | **8955 ms** |
-| 首轮完成 | 115989 ms | 9186 ms |
-| 同线程第 2 / 3 轮 | 5240 / 3325 ms | 5334 / 3181 ms |
-| **同一进程内另一个新线程的首轮** | 每个新线程都付满额 | **6943 ms** |
+| 进程启动 → 首个协议帧 | 342 ms | 363 ms |
+| **首轮：`turn/start` → 第一个 token** | **115821 ms** | **6616 ms** |
+| 首轮完成 | 115989 ms | 6816 ms |
+| 同线程第 2 / 3 轮 | 5240 / 3325 ms | — |
 
-真机走完整插件链路（真实登录态、真实 `codex.exe`）时，首轮 **4742 ms**、第二轮 **4051 ms**。
+同一时段开启 `httpTransport`（HTTP-only）测得首轮 7920–8468 ms。**在网络正常时，两种传输没有实质差异**；那个 116 秒是一次网络路径故障，不是必然行为。完整分析（含被证伪的中间结论）见 [docs/PERFORMANCE.md](docs/PERFORMANCE.md)。
 
-### 根因
+### 现象与定位
 
-Codex 的 ChatGPT 订阅通道优先使用 Responses-over-WebSocket。它在**每次会话的首轮之前做一次 prewarm**（一个 `generate=false` 的 `response.create`）并**阻塞等待它完成**，好让随后的正式请求复用同一条连接。见上游 `core/src/client.rs`：
+- **全部 115.8 秒都落在「已发出 `turn/start`」与「第一个 token」之间**——进程启动与建线程都不慢。
+- 期间 `codex.exe` 的 stderr **完全为空**，所以它看起来像卡死，而不是慢。
+- 回退是**会话级**的（上游 `ModelClient::force_http_fallback` 里 `disable_websockets` 一旦置位，该进程后续轮次不再尝试 WebSocket），这就是「首轮慢、之后只要 3–5 秒」那个形状的来源。
+
+### 与 WebSocket 的关系（重要更正）
+
+Codex 确实会在每个会话的首轮之前做一次 WebSocket prewarm 并**阻塞等待它完成**（上游 `core/src/client.rs`）：
 
 > WebSocket prewarm is a v2-only `response.create` with `generate=false`; it waits for completion so the next request can reuse the same connection and `previous_response_id`.
 
-本机上这个握手永远完不成，于是 Codex 一路重试到预算耗尽（`websocket_connect_timeout_ms` 默认 15000ms × `request_max_retries` 默认 4，共 5 次尝试 → 界面上就是 `Reconnecting... 2/5` … `5/5` 与 request timeout），才回退到 HTTPS。**115 秒全部发生在「已发出 turn/start」与「第一个 token」之间**，而 `codex.exe` 的 stderr 一句都不输出——所以它看起来完全像卡死。
+早先我把那 116 秒归因于「这个握手在本机永远完不成、于是等满重试预算（`websocket_connect_timeout_ms` 默认 15000ms × 5 次尝试）」。**这个因果链是错的**：故障消失后，同一个 home、同样允许 WebSocket 的冷启动首轮只要 **6616 ms**，与 HTTP-only 的 8138 ms 同级。所以慢的那次是**网络路径的一次瞬时故障**落在了握手上，而非 Codex 或本插件的固有行为。
 
-这个回退是**会话级**的：一旦某一轮启用了 HTTPS，该进程之后的轮次都走 HTTPS，因此同一线程的第 2、3 轮只要约 3 秒。回退本身是上游设计好的兜底路径，不是故障恢复。
+`supports_websockets = false` 因此**不是根因修复**，它的作用是：当 WebSocket 路径不通时**跳过那条重试阶梯**，不必先烧掉「超时 × 次数」。我未能在故障可复现时做受控 A/B，所以这一点只有时序上的相关性。
 
-### 修复
+### `config.toml` 里写了什么
 
 插件往自己的私有 `CODEX_HOME` 写一份 `config.toml`，声明一个**不用 WebSocket** 的 provider，让 Codex 一开始就走 HTTPS，不必先烧掉 115 秒：
 
@@ -213,7 +218,7 @@ supports_websockets = false
 
 1. **仅文本。** 图片附件不会被转发；`image` 块会变成字面占位符 `[image omitted: this provider route does not forward attachments yet]`。文件附件会退化为文件名（`[file attached: <name>]`）——内容不传输。
 2. **工具调用不由 DSH 驱动。** DSH 无法通过这条路由调用自己的工具，Codex 的工具活动也不会呈现给 DSH。
-3. **首轮仍有约 5 秒。** WebSocket prewarm 已经关掉（见上文「延迟」），但首轮仍要付 TLS/鉴权与 Codex 自身 agent 循环的启动开销；同线程后续轮次约 3 秒。长时间空闲、切换模型或改动系统提示，都会因闲置淘汰、16 线程上限或缓存失效而把你推回首轮路径。
+3. **首轮约 7 秒。** 要付 TLS、鉴权与 Codex 自身 agent 循环的启动开销；同线程后续轮次约 3 秒。长时间空闲、切换模型或改动系统提示，都会因闲置淘汰、16 线程上限或缓存失效而把你推回首轮路径。若某次首轮超过 ~15 秒且 stderr 为空，那是「延迟」一节里描述的网络路径瞬时故障，不是这里说的开销。
 4. **reasoning 不可见。** 不流式输出 reasoning 增量；只有当 app-server 的用量里带上时，推理 token 数才会被报告。
 5. **冷启动由超时约束，而不是由进度约束。** `startupTimeoutMs`（默认 120 秒）也约束 `turn/start` **请求本身**，`turnTimeoutMs`（默认 900 秒）约束整轮。超出上限的轮次会失败并丢弃线程。
 6. **DSH 对话不会出现在应用的线程历史里**（`ephemeralThreads` 默认为 true 时）——这是本意，但也意味着 DSH 驱动的对话不会在 `codex_threads_list` 中出现。

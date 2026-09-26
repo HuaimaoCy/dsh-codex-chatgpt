@@ -100,31 +100,35 @@ A request's system text is taken from `options.system` first, then from a leadin
 
 Because the system text is part of the thread's identity, changing the DSH system prompt invalidates the cached thread and forces a new one.
 
-## Latency: why the first turn used to cost 115 seconds
+## Latency: the 116-second first turn, and what it actually was
 
 Measured against `codex-cli 0.155.0-alpha.16.4` (same machine, same day):
 
-| Phase | Before (WebSocket transport on) | After (`httpTransport: true`, the default) |
+| Phase | The slow measurement (21:37) | After the fault cleared (22:29, same home, WebSocket still allowed) |
 |---|---|---|
-| Process start → first protocol frame | 342 ms | 309 ms |
-| **First turn: `turn/start` → first token** | **115821 ms** | **8955 ms** |
-| First turn to completion | 115989 ms | 9186 ms |
-| Turns 2 / 3 on the same thread | 5240 / 3325 ms | 5334 / 3181 ms |
-| **First turn of a second thread in the same process** | full cost, every new thread | **6943 ms** |
+| Process start → first protocol frame | 342 ms | 363 ms |
+| **First turn: `turn/start` → first token** | **115821 ms** | **6616 ms** |
+| First turn to completion | 115989 ms | 6816 ms |
 
-Over the whole plugin path (real login, real `codex.exe`) the first turn measured **4742 ms** and the second **4051 ms**.
+With `httpTransport` enabled (HTTPS only) over the same period, the first turn measured 7920–8468 ms. **With a healthy network the two transports show no material difference**; the 116 seconds was a transient network-path fault, not a property of this plugin or of Codex. The full analysis, including the explanation that was later disproved, is in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
-### Root cause
+### What is solid
 
-Codex's ChatGPT subscription channel prefers a Responses-over-WebSocket transport. It performs a **prewarm** before the first turn of a session — a `generate=false` `response.create` — and **blocks until that prewarm completes** so the following request can reuse the connection. Upstream, in `core/src/client.rs`:
+- **All 115.8 seconds sit between sending `turn/start` and receiving the first token.** Process start and thread creation were fast.
+- `codex.exe` writes **nothing to stderr** during that window, which is why it reads as a hang rather than as slowness.
+- The fallback is **session-scoped**: upstream's `ModelClient::force_http_fallback` latches `disable_websockets`, so every later turn in that process stops attempting WebSocket. That is where the "first turn slow, then 3–5 s" shape comes from.
+
+### The WebSocket prewarm, and a correction
+
+Codex does perform a WebSocket prewarm before the first turn of a session and **blocks until it completes** (upstream `core/src/client.rs`):
 
 > WebSocket prewarm is a v2-only `response.create` with `generate=false`; it waits for completion so the next request can reuse the same connection and `previous_response_id`.
 
-On this machine that handshake never completes, so Codex retries until the budget runs out (`websocket_connect_timeout_ms` defaults to 15000 ms, `request_max_retries` to 4, so five attempts — the `Reconnecting... 2/5` … `5/5` and request timeouts the desktop app shows), and only then falls back to HTTPS. **All 115 seconds sit between sending `turn/start` and receiving the first token**, and `codex.exe` writes nothing to stderr, which is why it looks exactly like a hang.
+I first attributed the 116 seconds to that handshake never completing, so that Codex waited out its retry budget (`websocket_connect_timeout_ms` defaults to 15000 ms, five attempts). **That causal chain is wrong**: once the fault cleared, a cold first turn on the same home with WebSocket still allowed took **6616 ms**, on par with 8138 ms over HTTPS only. The slow window was a transient network-path fault that landed on the handshake — not inherent behaviour.
 
-The fallback is **session-scoped**: once a turn activates HTTPS, every later turn in that process uses HTTPS, which is why turns 2 and 3 take about 3 seconds. The fallback itself is upstream's designed safety net, not error recovery.
+`supports_websockets = false` is therefore **not a root-cause fix**. Its real effect is to **skip the retry ladder** when the WebSocket path is unhealthy, instead of paying "timeout × attempts" first. I could not run a controlled A/B inside a reproducible fault window, so that claim rests on timing correlation only.
 
-### The fix
+### What the generated `config.toml` contains
 
 The plugin writes a `config.toml` into its private `CODEX_HOME` declaring a provider with **no WebSocket transport**, so Codex starts on HTTPS instead of burning 115 seconds first:
 
@@ -213,7 +217,7 @@ Reads `<authSource>\session_index.jsonl`, sorts by `updated_at` descending (stri
 
 1. **Text only.** Image attachments are not forwarded; an `image` block becomes the literal placeholder `[image omitted: this provider route does not forward attachments yet]`. File attachments are reduced to their name (`[file attached: <name>]`) — the content is not transmitted.
 2. **Tool use is not driven by DSH.** DSH cannot call its own tools through this route, and Codex's tool activity is not surfaced to DSH.
-3. **The first turn still costs ~5 s.** The WebSocket prewarm is gone (see Latency above), but the first turn still pays TLS, auth and the startup of Codex's own agent loop; later turns on that thread cost ~3 s. Long gaps or model/system-prompt changes push you back onto the first-turn path through idle eviction, the 16-thread ceiling, or invalidation.
+3. **The first turn costs ~7 s.** It pays TLS, auth and the startup of Codex's own agent loop; later turns on that thread cost ~3 s. Long gaps or model/system-prompt changes push you back onto the first-turn path through idle eviction, the 16-thread ceiling, or invalidation. A first turn that exceeds ~15 s with nothing on stderr is the transient network fault described under Latency, not this.
 4. **Reasoning is invisible.** No reasoning deltas are streamed; reasoning tokens are only reported in usage when the app-server includes them.
 5. **Cold start is bounded by timeouts, not by progress.** `startupTimeoutMs` (default 120 s) also bounds the `turn/start` *request* itself, and `turnTimeoutMs` (default 900 s) bounds the whole turn. A turn that exceeds its ceiling fails and drops the thread.
 6. **DSH conversations stay out of the app's history** while `ephemeralThreads` is true (the default) — that is the intent, but it also means DSH-driven conversations will not appear in `codex_threads_list`.
