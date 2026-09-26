@@ -1,0 +1,40 @@
+# dsh bundle patch: inserts the Codex ChatGPT provider into a profile's layer stack.
+#
+# The credential is inherited from the Codex desktop app rather than stored
+# here: this plugin never holds a token of its own. Only non-secret policy is
+# configured, so this file is safe to commit and share.
+- insert:
+    - id: codex-chatgpt
+      name: 'dsh-codex-chatgpt'
+      config:
+        provider: 'codex-chatgpt'
+        providerName: 'ChatGPT (Codex)'
+        # Empty means: read DSH_CODEX_EXECUTABLE, then discover the newest build
+        # under %LOCALAPPDATA%\OpenAI\Codex\bin\<hash>\codex.exe. The discovery
+        # order is configuration, then environment, then disk.
+        codexExecutable: ''
+        # Empty means: a private home under the DSH home
+        # (~/.dsh/codex-chatgpt). It must NOT be ~/.codex, whose sqlite state
+        # runtime the running desktop app holds exclusively.
+        codexHome: ''
+        # Where the ChatGPT credential (auth.json) is copied from.
+        authSource: ''
+        cwd: ''
+        # Headless provider: no UI exists to answer an approval prompt, so the
+        # Codex agent is never granted file or command authority.
+        approvalPolicy: 'never'
+        sandbox: 'read-only'
+        # Empty inherits each model's own default reasoning effort.
+        reasoningEffort: ''
+        # null lets the DSH system prompt become the Codex thread's
+        # baseInstructions, which replaces Codex's own agent system prompt.
+        baseInstructions: null
+        turnTimeoutMs: 900000
+        startupTimeoutMs: 120000
+        ephemeralThreads: true
+        environmentId: null
+        # true: the private CODEX_HOME's config.toml declares a provider with
+        # supports_websockets = false, so Codex goes straight to HTTPS instead of
+        # blocking on a WebSocket prewarm before the first turn of every session.
+        # That prewarm cost 115 s per session on this machine.
+        httpTransport: true
