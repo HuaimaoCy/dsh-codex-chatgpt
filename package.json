@@ -1,6 +1,6 @@
 {
   "name": "dsh-codex-chatgpt",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Use the ChatGPT models from the local Codex desktop app inside DeepSeek Harness: a first-class LLM provider plus conversation-access tools, backed by the Codex app-server and the desktop app's own ChatGPT sign-in.",
   "type": "module",
